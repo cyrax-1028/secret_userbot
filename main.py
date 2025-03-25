@@ -1,159 +1,244 @@
-import os
+import logging
+import asyncpg
 import asyncio
-import requests
+import os
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import Command
+from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
-from telethon import TelegramClient, events
-from telethon.sessions import StringSession
-import random
 
 load_dotenv()
 
-API_ID = os.getenv("API_ID")
-API_HASH = os.getenv("API_HASH")
-STRING_SESSION = os.getenv("STRING_SESSION")
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+TOKEN = os.getenv("TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
+ADMIN_IDS = set(map(int, os.getenv("ADMIN_IDS").split(",")))
+SECRET_GROUP_ID = int(os.getenv("SECRET_GROUP_ID"))
 
-client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
-
-channels = {
-    -1001337701474: -1001956847541,  # Inline
-    -1002460046152: -1001694845676,  # Futbolishee
-    # -1001980053407: -1002030769789,  # vamos
-    # -1001773705589: -1001981481442,  # Bilimdon
-    -1002339069316: -1002212791539,  # cyrax
-    -1002331884910: -1002273035080,  # Efuzpage
-    -1001449117896: -1002409602563,  # Stock
-    -1001974475685: -1002106652656  # efootball
-}
-
-channel_comments = {
-    -1001337701474: [  # Inline
-        "Ha 🗿",
-        "Ha",
-        "Mobiuz effekt"
-    ],
-    -1002460046152: [  # Futbolishee
-        "Ha 🗿",
-        "Zo'r 👍",
-        "Mobiuz effekt",
-        "Bekorchini sindiramiz rekasiya 🔥"
-    ],
-    # -1001980053407: [  # vamos
-    #     "Vamos 🔥",
-    #     "Juda zo'r kanal",
-    #     "Ma'lumotlar juda ham qiziqarli ekan! Rahmat!",
-    #     "Bunday sifatli kontent topish qiyin, zo‘r kanal! 🔥",
-    #     "Uzmobile effekt",
-    #     "..."
-    # ],
-    # -1001773705589: [  # bilimdon
-    #     "🔥",
-    #     "Juda zo'r kanal",
-    #     "Profilfagi kanalga o'tib olilar desam boloradimi",
-    #     "Uzmobile effekt",
-    #     "..."
-    # ],
-    -1002331884910: [  # efuzpage
-        "🔥",
-        "Ha",
-        "Bekorchini sindiramiz rekasiya 🔥",
-        "Mobiuz effekt",
-        "😕",
-        "Eng zo'r efootball kanal 👍"
-    ],
-    -1001974475685: [  # Efootball
-        "Mobiuz effekt",
-        "Ha 🗿",
-        "Zo'r 👍",
-        "Bekorchini sindiramiz rekasiya 🔥",
-        "🗿"
-    ],
-    -1001449117896: [  # Stok
-        "Ha",
-        "Zo'r",
-        ".",
-        "👍"
-    ],
-    -1002339069316: [  # Cyrax
-        "Zo'r",
-        "Ha",
-        "Uzmobile effekt",
-    ],
-}
+bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+dp = Dispatcher()
+db = None
 
 
-def send_to_bot(message):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    data = {"chat_id": CHAT_ID, "text": message}
-    try:
-        requests.post(url, data=data)
-    except Exception as e:
-        print(f"⚠️ Xatolik botga xabar yuborishda: {e}")
+async def init_db():
+    global db
+    db = await asyncpg.create_pool(DATABASE_URL)
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id BIGINT PRIMARY KEY,
+            invited_count INT DEFAULT 0,
+            referral_link TEXT,
+            is_subscriber BOOLEAN DEFAULT FALSE,
+            referrer_id BIGINT
+        )
+    """)
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS channels (
+            id SERIAL PRIMARY KEY,
+            username TEXT UNIQUE NOT NULL
+        )
+    """)
+
+
+async def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
+async def is_subscribed(user_id: int) -> bool:
+    channels = await db.fetch("SELECT username FROM channels")
+    for channel in channels:
+        try:
+            member = await bot.get_chat_member(chat_id=f"@{channel['username']}", user_id=user_id)
+            if member.status not in ["member", "administrator", "creator"]:
+                return False
+        except Exception:
+            return False
+    return True
+
+
+async def generate_invite_link():
+    invite_link = await bot.create_chat_invite_link(SECRET_GROUP_ID, expire_date=None, member_limit=1)
+    return invite_link.invite_link
+
+
+async def get_or_create_user(user_id: int, referrer_id=None):
+    ref_link = f"https://t.me/moviestestrobot?start={user_id}"
+    user = await db.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
+
+    if not user:  # Foydalanuvchi bazada yo'q bo'lsa, yangisini qo'shamiz
+        await db.execute(
+            "INSERT INTO users (user_id, referral_link, referrer_id) VALUES ($1, $2, $3)",
+            user_id, ref_link, referrer_id
+        )
+        return ref_link, True  # Yangi foydalanuvchi qo'shildi
+
+    return ref_link, False  # Foydalanuvchi allaqachon bor
+
+
+async def update_referrer(referrer_id: int):
+    await db.execute("UPDATE users SET invited_count = invited_count + 1 WHERE user_id = $1", referrer_id)
+    invited_count = await db.fetchval("SELECT invited_count FROM users WHERE user_id=$1", referrer_id)
+
+    if invited_count >= 5:
+        invite_link = await generate_invite_link()
+        await bot.send_message(referrer_id,
+                               f"🎉 Siz 5 ta odamni kanalga qo‘shdingiz!\n🔗 Guruhga kirish havolasi: {invite_link}")
+
+
+@dp.message(Command("check"))
+async def check_referrals(message: types.Message):
+    user_id = message.from_user.id
+    count = await db.fetchval("SELECT invited_count FROM users WHERE user_id=$1", user_id) or 0
+
+    if count >= 5:
+        invite_link = await generate_invite_link()
+        await message.answer(f"🎉 Siz {count} ta odamni kanalga qo‘shdingiz! \n🔗 Guruhga kirish havolasi: {invite_link}")
+    else:
+        await message.answer(f"📊 Siz {count}/5 ta odamni taklif qildingiz.\n👥 Yana {5 - count} ta odam taklif qiling!")
+
+
+@dp.message(Command("start"))
+async def start(message: types.Message):
+    user_id = message.from_user.id
+    referrer_id = None
+
+    if len(message.text.split()) > 1:
+        referrer_id = message.text.split(" ")[1]
+        if referrer_id.isdigit():
+            referrer_id = int(referrer_id)
+
+    ref_link, is_new_user = await get_or_create_user(user_id, referrer_id)
+
+    if await is_admin(user_id):
+        await message.answer(
+            "👑 Siz adminsiz, obuna shart emas.\n\nAdmin buyruqlari => /admin")
+        return
+
+    if not await is_subscribed(user_id):
+        channels = await db.fetch("SELECT username FROM channels")
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"✅ {channel['username']} ga a’zo bo‘lish",
+                                  url=f"https://t.me/{channel['username']}")]
+            for channel in channels
+        ])
+        keyboard.inline_keyboard.append([InlineKeyboardButton(text="🔄 Tekshirish", callback_data="check_sub")])
+
+        await message.answer("⚠️ Botdan foydalanish uchun quyidagi kanallarga a’zo bo‘ling:", reply_markup=keyboard)
+        return
+
+    await db.execute("UPDATE users SET is_subscriber = TRUE WHERE user_id = $1", user_id)
+
+    if is_new_user and referrer_id and referrer_id != user_id:
+        await update_referrer(referrer_id)
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Do‘stlarga yuborish", url=f"https://t.me/share/url?url={ref_link}")]
+    ])
+
+    await message.answer(
+        f"👋 Salom!\nSizning shaxsiy referal havolangiz:\n\n<code>{ref_link}</code>\n\nDo‘stlaringizni kanalga taklif qiling!",
+        reply_markup=keyboard
+    )
+
+
+@dp.callback_query(lambda c: c.data == "check_sub")
+async def check_subscription(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+
+    if await is_subscribed(user_id):
+        await db.execute("UPDATE users SET is_subscriber = TRUE WHERE user_id = $1", user_id)
+
+        user = await db.fetchrow("SELECT referrer_id FROM users WHERE user_id = $1", user_id)
+        referrer_id = user["referrer_id"] if user else None
+
+        if referrer_id and referrer_id != user_id:
+            await update_referrer(referrer_id)
+
+        await callback_query.message.answer("✅ Siz obuna bo‘lgansiz!")
+    else:
+        await callback_query.answer("❌ Hali obuna bo‘lmagansiz!", show_alert=True)
+
+
+@dp.message(Command("add_channel"))
+async def add_channel(message: types.Message):
+    if not await is_admin(message.from_user.id):
+        await message.answer("❌ Bu buyruq faqat adminlar uchun!")
+        return
+
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("❌ Kanal username kiriting: <code>/add_channel KanalUsername</code>", parse_mode="HTML")
+        return
+
+    channel_username = args[1].replace("@", "")
+
+    existing_channel = await db.fetchrow("SELECT username FROM channels WHERE username = $1", channel_username)
+    if existing_channel:
+        await message.answer(f"⚠️ @{channel_username} kanal allaqachon bazada mavjud.")
+        return
+
+    await db.execute("INSERT INTO channels (username) VALUES ($1)", channel_username)
+    await message.answer(f"✅ @{channel_username} kanal qo‘shildi!")
+
+
+@dp.message(Command("remove_channel"))
+async def remove_channel(message: types.Message):
+    if not await is_admin(message.from_user.id):
+        await message.answer("❌ Bu buyruq faqat adminlar uchun!")
+        return
+
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("❌ Kanal username kiriting: <code>/add_channel KanalUsername</code>", parse_mode="HTML")
+        return
+
+    channel_username = args[1].replace("@", "")
+
+    result = await db.execute("DELETE FROM channels WHERE username = $1 RETURNING username", channel_username)
+
+    if result:
+        await message.answer(f"🚫 @{channel_username} kanal o‘chirildi!")
+    else:
+        await message.answer(f"⚠️ @{channel_username} kanal bazada topilmadi.")
+
+
+@dp.message(Command("channels"))
+async def list_channels(message: types.Message):
+    if not await is_admin(message.from_user.id):
+        await message.answer("❌ Bu buyruq faqat adminlar uchun!")
+        return
+
+    channels = await db.fetch("SELECT username FROM channels")
+
+    if not channels:
+        await message.answer("⚠️ Hech qanday kanal qo‘shilmagan.")
+        return
+
+    channel_list = "\n".join([f"@{ch['username']}" for ch in channels])
+    await message.answer(f"📌 Hozirgi kanallar:\n{channel_list}")
+
+
+@dp.message(Command("admin"))
+async def admin_panel(message: types.Message):
+    if not await is_admin(message.from_user.id):
+        return
+
+    admin_commands = """
+🔧 <b>Admin Buyruqlari:</b>
+
+/add_channel — Kanal qo‘shish
+/remove_channel — Kanalni o‘chirish
+/channels — Barcha kanallar ro‘yxati
+    """
+
+    await message.answer(admin_commands, parse_mode="HTML")
 
 
 async def main():
-    await client.start()
-    print("✅ Userbot Railway'da ishga tushdi!")
-    send_to_bot("✅ Userbot Railway'da ishga tushdi!")
+    logging.basicConfig(level=logging.INFO)
+    await init_db()
+    await dp.start_polling(bot)
 
 
-@client.on(events.NewMessage(chats=list(channels.keys())))
-async def handler(event):
-    try:
-        if event.is_channel:
-            channel_id = event.chat_id
-            linked_chat_id = channels.get(channel_id)
-
-            entity = await client.get_entity(channel_id)
-            channel_name = entity.title
-
-            message = f"✅ Yangi post topildi! Kanal: {channel_name} (ID: {channel_id}), Post ID: {event.id}"
-            print(message)
-            send_to_bot(message)
-
-            start_time = asyncio.get_event_loop().time()
-            found = False
-
-            while asyncio.get_event_loop().time() - start_time < 5:
-                async for msg in client.iter_messages(linked_chat_id, limit=10):
-                    if msg.forward and msg.forward.original_fwd:
-                        if msg.forward.original_fwd.channel_post == event.id:
-                            message = f"🔗 Ulangan post topildi! Guruhdagi ID: {msg.id}"
-                            print(message)
-                            send_to_bot(message)
-
-                            if channel_id in channel_comments:
-                                comment_list = channel_comments[channel_id]
-                                comment = random.choice(comment_list)
-                            else:
-                                comment = "Ajoyib kanal ekan! 😊"
-
-                            await client.send_message(linked_chat_id, comment, reply_to=msg.id)
-
-                            message = f"💬 Fikr bildirish bo‘limiga sharh yuborildi!: {comment}"
-                            print(message)
-                            send_to_bot(message)
-
-                            found = True
-                            break
-
-                if found:
-                    break
-
-                await asyncio.sleep(0.3)
-
-            if not found:
-                message = "⛔ Guruhda mos post topilmadi!"
-                print(message)
-                send_to_bot(message)
-
-    except Exception as e:
-        message = f"⚠️ Xatolik: {e}"
-        print(message)
-        send_to_bot(message)
-
-
-with client:
-    client.loop.run_until_complete(main())
-    client.run_until_disconnected()
+if __name__ == "__main__":
+    asyncio.run(main())
