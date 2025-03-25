@@ -12,7 +12,7 @@ load_dotenv()
 
 TOKEN = os.getenv("TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
-ADMIN_IDS = set(map(int, os.getenv("ADMIN_IDS").split(",")))
+ADMIN_IDS = [int(i) for i in os.getenv("ADMIN_IDS", "").split(',') if i.strip().isdigit()]
 SECRET_GROUP_ID = int(os.getenv("SECRET_GROUP_ID"))
 
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
