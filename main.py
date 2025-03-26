@@ -39,6 +39,10 @@ async def init_db():
         )
     """)
 
+    await db.execute("""
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS referrer_given BOOLEAN DEFAULT FALSE
+    """)
+
 
 async def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
@@ -62,7 +66,7 @@ async def generate_invite_link():
 
 
 async def get_or_create_user(user_id: int, referrer_id=None):
-    ref_link = f"https://t.me/jurismind_bot?start={user_id}"
+    ref_link = f"https://t.me/juristmind_bot?start={user_id}"
     user = await db.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
 
     if not user:  # Foydalanuvchi bazada yo'q bo'lsa, yangisini qo'shamiz
@@ -115,6 +119,7 @@ async def start(message: types.Message):
         return
 
     if not await is_subscribed(user_id):
+        await db.execute("UPDATE users SET is_subscriber = FALSE WHERE user_id = $1", user_id)
         channels = await db.fetch("SELECT username FROM channels")
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=f"✅ {channel['username']} ga a’zo bo‘lish",
@@ -128,8 +133,19 @@ async def start(message: types.Message):
 
     await db.execute("UPDATE users SET is_subscriber = TRUE WHERE user_id = $1", user_id)
 
-    if is_new_user and referrer_id and referrer_id != user_id:
-        await update_referrer(referrer_id)
+    user_data = await db.fetchrow("SELECT referrer_given FROM users WHERE user_id = $1", user_id)
+    referrer_given = user_data["referrer_given"] if user_data else False
+
+    print(f"User ID: {user_id}, Referrer ID: {referrer_id}, Referrer Given: {referrer_given}")
+
+    if is_new_user and referrer_id and referrer_id != user_id and not referrer_given:
+        print(f"Updating referrer {referrer_id} for user {user_id}")
+        await update_referrer(referrer_id)  # Refererga bonus qo‘shish
+        await db.execute("UPDATE users SET referrer_given = TRUE WHERE user_id = $1", user_id)
+
+        # Yozilganini tekshiramiz
+        check_data = await db.fetchrow("SELECT referrer_given FROM users WHERE user_id = $1", user_id)
+        print(f"After update, Referrer Given: {check_data['referrer_given']}")
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📢 Do‘stlarga yuborish", url=f"https://t.me/share/url?url={ref_link}")]
@@ -148,13 +164,17 @@ async def check_subscription(callback_query: types.CallbackQuery):
     if await is_subscribed(user_id):
         await db.execute("UPDATE users SET is_subscriber = TRUE WHERE user_id = $1", user_id)
 
-        user = await db.fetchrow("SELECT referrer_id FROM users WHERE user_id = $1", user_id)
+        user = await db.fetchrow("SELECT referrer_id, referrer_given FROM users WHERE user_id = $1", user_id)
         referrer_id = user["referrer_id"] if user else None
+        referrer_given = user["referrer_given"] if user else False
 
-        if referrer_id and referrer_id != user_id:
+        if referrer_id and referrer_id != user_id and not referrer_given:
+            print(f"Checking referrer for user {user_id}. Referrer ID: {referrer_id}, Referrer Given: {referrer_given}")
             await update_referrer(referrer_id)
+            await db.execute("UPDATE users SET referrer_given = TRUE WHERE user_id = $1", user_id)
 
-        await callback_query.message.answer("✅ Siz obuna bo‘lgansiz!")
+        await callback_query.message.answer(
+            "✅ Siz obuna bo‘lgansiz!\n /start buyrug'i orqali botni qaytadan ishga tushiring")
     else:
         await callback_query.answer("❌ Hali obuna bo‘lmagansiz!", show_alert=True)
 
