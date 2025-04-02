@@ -66,7 +66,7 @@ async def generate_invite_link():
 
 
 async def get_or_create_user(user_id: int, referrer_id=None):
-    ref_link = f"https://t.me/juristmind_bot?start={user_id}"
+    ref_link = f"https://t.me/jurismind_bot?start={user_id}"
     user = await db.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
 
     if not user:  # Foydalanuvchi bazada yo'q bo'lsa, yangisini qo'shamiz
